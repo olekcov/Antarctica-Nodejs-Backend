@@ -11,6 +11,9 @@ const ANTEMI_BASE_URL = process.env.ANTEMI_BASE_URL || 'https://antemi-1128ccbac
 const ANTEMI_CLIENT_ID = process.env.ANTEMI_CLIENT_ID || '';
 const ANTEMI_CLIENT_SECRET = process.env.ANTEMI_CLIENT_SECRET || '';
 
+// Per-request timeout (ms) — protects against Antemi/Heroku stalls
+const ANTEMI_REQUEST_TIMEOUT_MS = Number(process.env.ANTEMI_REQUEST_TIMEOUT_MS || 15000);
+
 // ─── Types ──────────────────────────────────────────────────────────────────
 
 export interface AntemiVehicleData {
@@ -69,9 +72,14 @@ export interface AntemiLookupResult {
 let cachedToken: string | null = null;
 let tokenExpiresAt: number = 0;
 
-async function getAccessToken(): Promise<string> {
+function invalidateToken(): void {
+  cachedToken = null;
+  tokenExpiresAt = 0;
+}
+
+async function getAccessToken(forceRefresh = false): Promise<string> {
   // Return cached token if still valid (with 60s safety margin)
-  if (cachedToken && Date.now() < tokenExpiresAt - 60_000) {
+  if (!forceRefresh && cachedToken && Date.now() < tokenExpiresAt - 60_000) {
     return cachedToken;
   }
 
@@ -79,48 +87,81 @@ async function getAccessToken(): Promise<string> {
     throw new Error('Antemi API credentials not configured (ANTEMI_CLIENT_ID / ANTEMI_CLIENT_SECRET)');
   }
 
-  console.log('🔐 Antemi: requesting new OAuth token...');
+  console.log(`🔐 Antemi: requesting new OAuth token${forceRefresh ? ' (forced refresh)' : ''}...`);
 
-  const response = await fetch(`${ANTEMI_BASE_URL}/oauth/token`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({
-      client_id: ANTEMI_CLIENT_ID,
-      client_secret: ANTEMI_CLIENT_SECRET,
-      grant_type: 'client_credentials',
-    }).toString(),
-  });
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), ANTEMI_REQUEST_TIMEOUT_MS);
 
-  if (!response.ok) {
-    const errorText = await response.text();
-    console.error(`❌ Antemi OAuth failed (${response.status}):`, errorText.substring(0, 300));
-    throw new Error(`Antemi OAuth failed: ${response.status} ${response.statusText}`);
+  try {
+    const response = await fetch(`${ANTEMI_BASE_URL}/oauth/token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        client_id: ANTEMI_CLIENT_ID,
+        client_secret: ANTEMI_CLIENT_SECRET,
+        grant_type: 'client_credentials',
+      }).toString(),
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error(`❌ Antemi OAuth failed (${response.status}):`, errorText.substring(0, 300));
+      throw new Error(`Antemi OAuth failed: ${response.status} ${response.statusText}`);
+    }
+
+    const data = await response.json() as { access_token: string; token_type: string; expires_in: number };
+    cachedToken = data.access_token;
+    // expires_in is in seconds; convert to ms
+    tokenExpiresAt = Date.now() + (data.expires_in || 900) * 1000;
+
+    console.log(`✅ Antemi token obtained (expires in ${data.expires_in}s)`);
+    return cachedToken;
+  } finally {
+    clearTimeout(timeoutId);
   }
-
-  const data = await response.json() as { access_token: string; token_type: string; expires_in: number };
-  cachedToken = data.access_token;
-  // expires_in is in seconds; convert to ms
-  tokenExpiresAt = Date.now() + (data.expires_in || 900) * 1000;
-
-  console.log(`✅ Antemi token obtained (expires in ${data.expires_in}s)`);
-  return cachedToken;
 }
 
 // ─── Authenticated GET helper ───────────────────────────────────────────────
+// - applies per-request timeout via AbortController
+// - on 401, invalidates cached token and retries once with a fresh token
+//   (Antemi docs warn the 15-min token can expire/be revoked mid-session)
 
-async function antemiGet(path: string): Promise<any> {
+async function antemiGet(path: string, _retried = false): Promise<any> {
   const token = await getAccessToken();
   const url = `${ANTEMI_BASE_URL}${path}`;
 
   console.log(`🔗 Antemi GET: ${url}`);
 
-  const response = await fetch(url, {
-    method: 'GET',
-    headers: {
-      'Authorization': `Bearer ${token}`,
-      'Accept': 'application/json',
-    },
-  });
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), ANTEMI_REQUEST_TIMEOUT_MS);
+
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Accept': 'application/json',
+      },
+      signal: controller.signal,
+    });
+  } catch (err: any) {
+    if (err?.name === 'AbortError') {
+      throw new Error(`Antemi request timed out after ${ANTEMI_REQUEST_TIMEOUT_MS}ms: ${path}`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+
+  // Token revoked / expired early → refresh and retry once
+  if (response.status === 401 && !_retried) {
+    console.warn(`⚠️ Antemi 401 on ${path} — refreshing token and retrying once`);
+    invalidateToken();
+    await getAccessToken(true);
+    return antemiGet(path, true);
+  }
 
   if (!response.ok) {
     const errorText = await response.text();
@@ -128,19 +169,27 @@ async function antemiGet(path: string): Promise<any> {
     throw new Error(`Antemi API error ${response.status}: ${errorText.substring(0, 200)}`);
   }
 
-  // Some endpoints return plain text (e.g. InfoAuto), detect by content-type
+  // Some endpoints return plain text (e.g. InfoAuto, codpost_*); detect by content-type
   const contentType = response.headers.get('content-type') || '';
   if (contentType.includes('application/json')) {
-    return response.json();
+    const json = await response.json();
+    // Treat explicit empty objects/arrays as "no data" per docx guidance
+    if (json === null || (Array.isArray(json) && json.length === 0)) return null;
+    return json;
   }
-  return response.text();
+  const text = await response.text();
+  return text?.trim() ? text : null;
 }
 
 // ─── 1. Vehicle Lookup by Plate ─────────────────────────────────────────────
 
 export async function lookupVehicleByPlate(plate: string): Promise<AntemiVehicleData | null> {
   try {
-    const data = await antemiGet(`/api/v1/vehiculos/${encodeURIComponent(plate.toUpperCase())}`);
+    if (!plate?.trim()) {
+      console.warn('⚠️ Antemi vehicle: missing plate');
+      return null;
+    }
+    const data = await antemiGet(`/api/v1/vehiculos/${encodeURIComponent(plate.trim().toUpperCase())}`);
     if (!data || (!data.marca && !data.dominio)) {
       console.log(`⚠️ Antemi: no vehicle found for plate=${plate}`);
       return null;
@@ -163,7 +212,12 @@ export async function lookupVehicleByPlate(plate: string): Promise<AntemiVehicle
 
 export async function lookupInfoAuto(marca: string, modelo: string, anio: string): Promise<AntemiInfoAutoResult | null> {
   try {
-    const path = `/api/v1/infoauto/${encodeURIComponent(marca)}/${encodeURIComponent(modelo)}/${encodeURIComponent(anio)}`;
+    if (!marca?.trim() || !modelo?.trim() || !anio?.trim()) {
+      console.warn(`⚠️ Antemi InfoAuto: missing input (marca=${marca}, modelo=${modelo}, anio=${anio})`);
+      return null;
+    }
+    // Per docx: URL-encode each segment (e.g. "308 FELINE HDI" → "308%20FELINE%20HDI")
+    const path = `/api/v1/infoauto/${encodeURIComponent(marca.trim())}/${encodeURIComponent(modelo.trim())}/${encodeURIComponent(anio.trim())}`;
     const data = await antemiGet(path);
 
     // Response is a string like: "308 FELINE HDI (32|991|80)"
@@ -208,7 +262,11 @@ export async function lookupInfoAuto(marca: string, modelo: string, anio: string
 
 export async function lookupPersonByDNI(dni: string): Promise<AntemiPersonData | null> {
   try {
-    const data = await antemiGet(`/api/v1/personas/${encodeURIComponent(dni)}`);
+    if (!dni?.trim()) {
+      console.warn('⚠️ Antemi person: missing DNI');
+      return null;
+    }
+    const data = await antemiGet(`/api/v1/personas/${encodeURIComponent(dni.trim())}`);
 
     if (!data || typeof data !== 'object') {
       console.log(`⚠️ Antemi: no person found for DNI=${dni}`);

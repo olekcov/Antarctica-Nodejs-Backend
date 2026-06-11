@@ -5,7 +5,14 @@ import { supabaseAdmin } from '../config/supabase';
 import { authenticate, requireApproved, AuthRequest } from '../middleware/auth';
 import { validateQuote } from '../services/ai-validation';
 import { cotizarAutomotor, parseVehicleDescription, getRamaDefaults } from '../services/antartida-api';
-import { fullLookup, lookupInfoAuto, lookupPostalCodeByAddress, lookupPostalCodeByCode } from '../services/antemi-api';
+import {
+  fullLookup,
+  lookupVehicleByPlate,
+  lookupPersonByDNI,
+  lookupInfoAuto,
+  lookupPostalCodeByAddress,
+  lookupPostalCodeByCode,
+} from '../services/antemi-api';
 import { generateMotor, generateChasis } from '../services/relaxit-api';
 
 const router = Router();
@@ -14,6 +21,84 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 
 // All routes require authentication
 router.use(authenticate);
 router.use(requireApproved);
+
+// ─── Individual Antemi lookup endpoints ────────────────────────────────────
+// Thin pass-throughs that match the API docx 1:1 so the mobile / admin app
+// can call any single step of the flow without creating a quote first.
+// IMPORTANT: declared BEFORE any /:id route so Express does not match
+// "lookup" as a quote id.
+
+// GET /quotes/lookup/vehicle/:plate
+router.get('/lookup/vehicle/:plate', async (req: AuthRequest, res: Response) => {
+  try {
+    const { plate } = req.params;
+    const vehicle = await lookupVehicleByPlate(plate);
+    if (!vehicle) return res.status(404).json({ error: 'Vehicle not found', plate });
+    res.json({ vehicle, source: 'antemi' });
+  } catch (error: any) {
+    console.error('Antemi vehicle lookup error:', error);
+    res.status(502).json({ error: 'Antemi vehicle lookup failed', details: error?.message });
+  }
+});
+
+// GET /quotes/lookup/person/:dni
+router.get('/lookup/person/:dni', async (req: AuthRequest, res: Response) => {
+  try {
+    const { dni } = req.params;
+    const person = await lookupPersonByDNI(dni);
+    if (!person) return res.status(404).json({ error: 'Person not found', dni });
+    res.json({ person, source: 'antemi' });
+  } catch (error: any) {
+    console.error('Antemi person lookup error:', error);
+    res.status(502).json({ error: 'Antemi person lookup failed', details: error?.message });
+  }
+});
+
+// GET /quotes/lookup/infoauto?marca=&modelo=&anio=
+router.get('/lookup/infoauto', async (req: AuthRequest, res: Response) => {
+  try {
+    const { marca, modelo, anio } = req.query as Record<string, string>;
+    if (!marca || !modelo || !anio) {
+      return res.status(400).json({ error: 'marca, modelo and anio are required' });
+    }
+    const infoAuto = await lookupInfoAuto(marca, modelo, anio);
+    if (!infoAuto) {
+      return res.status(404).json({ error: 'InfoAuto match not found', marca, modelo, anio });
+    }
+    res.json({ infoAuto, source: 'antemi' });
+  } catch (error: any) {
+    console.error('Antemi InfoAuto lookup error:', error);
+    res.status(502).json({ error: 'Antemi InfoAuto lookup failed', details: error?.message });
+  }
+});
+
+// GET /quotes/lookup/postal
+//   - by address:  ?direccion=...&localidad=...&letra=B
+//   - by code:     ?cp=1846
+router.get('/lookup/postal', async (req: AuthRequest, res: Response) => {
+  try {
+    const { direccion, localidad, letra, cp } = req.query as Record<string, string>;
+
+    let postalCode = null;
+    if (cp) {
+      postalCode = await lookupPostalCodeByCode(cp);
+    } else if (direccion && localidad) {
+      postalCode = await lookupPostalCodeByAddress(direccion, localidad, letra);
+    } else {
+      return res.status(400).json({
+        error: 'Provide either ?cp=NNNN or ?direccion=...&localidad=...',
+      });
+    }
+
+    if (!postalCode) {
+      return res.status(404).json({ error: 'Postal code not found' });
+    }
+    res.json({ postalCode, source: 'antemi' });
+  } catch (error: any) {
+    console.error('Antemi postal-code lookup error:', error);
+    res.status(502).json({ error: 'Antemi postal-code lookup failed', details: error?.message });
+  }
+});
 
 // POST /quotes - Create draft
 router.post('/', async (req: AuthRequest, res: Response) => {
