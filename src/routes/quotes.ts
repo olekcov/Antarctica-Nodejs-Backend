@@ -31,7 +31,7 @@ router.use(requireApproved);
 // GET /quotes/lookup/vehicle/:plate
 router.get('/lookup/vehicle/:plate', async (req: AuthRequest, res: Response) => {
   try {
-    const { plate } = req.params;
+    const { plate } = req.params as { plate: string };
     const vehicle = await lookupVehicleByPlate(plate);
     if (!vehicle) return res.status(404).json({ error: 'Vehicle not found', plate });
     res.json({ vehicle, source: 'antemi' });
@@ -44,7 +44,7 @@ router.get('/lookup/vehicle/:plate', async (req: AuthRequest, res: Response) => 
 // GET /quotes/lookup/person/:dni
 router.get('/lookup/person/:dni', async (req: AuthRequest, res: Response) => {
   try {
-    const { dni } = req.params;
+    const { dni } = req.params as { dni: string };
     const person = await lookupPersonByDNI(dni);
     if (!person) return res.status(404).json({ error: 'Person not found', dni });
     res.json({ person, source: 'antemi' });
